@@ -8,6 +8,11 @@ const FAR_SCALE = 0.8, NEAR_SCALE = 1.0;
 const MAX_PULL = 55, MAX_SHOT_SPEED = 150, MIN_PULL_TO_FIRE = 4;
 const FRICTION_BASE = 1.05, MIN_SPEED = 3;
 const REST_CUSHION = 0.75, REST_BALL = 0.9;
+// Spin (english/follow/draw) — a simplified, feel-tuned approximation, not textbook rigid-body mechanics.
+// spinTop/spinSide are velocity-equivalent scalars (same units as vx/vy), not literal angular velocity.
+const SLIDE_FRICTION = 90, ROLL_FRICTION = 16;
+const SPIN_SIDE_DECAY = 0.65, CURVE_FACTOR = 0.011, CUSHION_SPIN_KICK = 0.06, THROW_FACTOR = 0.16;
+const SPIN_TOP_FACTOR = 0.68, SPIN_SIDE_FACTOR = 0.42;
 const CUE_START = { x: TABLE_W / 2, y: 78 };
 const POCKETS = [
   { x: 0, y: 0 }, { x: TABLE_W, y: 0 }, { x: 0, y: TABLE_H }, { x: TABLE_W, y: TABLE_H },
@@ -33,7 +38,7 @@ const BALL_STYLES = [
   { color: "#E066B3", stripe: false }, // 9
 ];
 
-const POOL_TTS = `Welcome to Table Pool. Drag your finger anywhere on the table, pull back from the cue ball, and let go to take your shot — the further you pull back, the harder you'll hit. A thick line shows exactly where the ball will go, and a rising tone helps you line up a pocket by ear. If you'd rather play without that, there's an audio guide toggle below to turn it off any time. Sink the balls in order, starting with number one. There's no clock, and no penalty for missing — take all the time you need. Choose your difficulty below, then tap Start Game when you're ready.`;
+const POOL_TTS = `Welcome to Table Pool. Drag your finger anywhere on the table, pull back from the cue ball, and let go to take your shot — the further you pull back, the harder you'll hit. A thick line shows exactly where the ball will go, and a rising tone helps you line up a pocket by ear. If you'd rather play without that, there's an audio guide toggle below to turn it off any time. Once you're in a game, you'll also see spin buttons below the table — tap Follow or Draw to make the cue ball roll forward or pull back after it hits another ball, or Left or Right to curve its path. Leave them on Center for a plain, straightforward shot. Sink the balls in order, starting with number one. There's no clock, and no penalty for missing — take all the time you need. Choose your difficulty below, then tap Start Game when you're ready.`;
 const POOL_BYE = `Well played — the table's clear. That's real spatial thinking and planning, shot after shot. Come back whenever you'd like another game.`;
 
 // ── PROJECTION (elevated overhead view) ──────────────────────────────────────
@@ -65,14 +70,14 @@ function makeRack(count) {
     for (let i = 0; i < inRow; i++) {
       if (n > count) break outer;
       const style = BALL_STYLES[(n - 1) % BALL_STYLES.length];
-      balls.push({ id: `b${n}`, isCue: false, num: n, x: cx + (i - row / 2) * spacing, y: rowY, vx: 0, vy: 0, r: BALL_R, color: style.color, stripe: style.stripe });
+      balls.push({ id: `b${n}`, isCue: false, num: n, x: cx + (i - row / 2) * spacing, y: rowY, vx: 0, vy: 0, spinTop: 0, spinSide: 0, r: BALL_R, color: style.color, stripe: style.stripe });
       n++;
     }
     row++;
   }
   return balls;
 }
-function makeCue() { return { id: "cue", isCue: true, num: 0, x: CUE_START.x, y: CUE_START.y, vx: 0, vy: 0, r: BALL_R }; }
+function makeCue() { return { id: "cue", isCue: true, num: 0, x: CUE_START.x, y: CUE_START.y, vx: 0, vy: 0, spinTop: 0, spinSide: 0, r: BALL_R }; }
 
 function computeAimEndpoint(cueX, cueY, dirX, dirY, balls) {
   const margin = BALL_R;
@@ -96,13 +101,58 @@ function computeAimEndpoint(cueX, cueY, dirX, dirY, balls) {
 }
 
 // ── PHYSICS STEP ──────────────────────────────────────────────────────────────
+// Spin model: simplified/feel-tuned, not textbook rigid-body billiards. spinTop/spinSide are
+// velocity-equivalent scalars. A struck ball starts "sliding" (fast friction converts speed<->spinTop
+// toward each other); once they roughly match, it "rolls" (much gentler friction) — the classic
+// skid-then-roll two-phase deceleration. spinSide gradually curves the path and decays via cloth friction.
+function applySpinFriction(b, dt, frictionRate) {
+  const speed = Math.hypot(b.vx, b.vy);
+  if (speed < 0.001 && Math.abs(b.spinTop) < 0.5 && Math.abs(b.spinSide) < 0.5) {
+    b.vx = 0; b.vy = 0; b.spinTop = 0; b.spinSide = 0;
+    return;
+  }
+  const dirX = speed > 0.001 ? b.vx / speed : 0;
+  const dirY = speed > 0.001 ? b.vy / speed : 0;
+  const slip = speed - b.spinTop;
+  let newSpeed, newSpinTop;
+  if (Math.abs(slip) > 1.2) {
+    const rate = SLIDE_FRICTION * frictionRate * dt;
+    newSpeed = Math.max(0, speed - Math.sign(slip) * Math.min(rate, Math.abs(slip)));
+    newSpinTop = b.spinTop + Math.sign(slip) * Math.min(rate * 1.3, Math.abs(slip) * 0.9);
+  } else {
+    const rate = ROLL_FRICTION * frictionRate * dt;
+    newSpeed = Math.max(0, speed - rate);
+    const sign = Math.sign(b.spinTop) || 1;
+    newSpinTop = sign * Math.max(0, Math.abs(b.spinTop) - rate);
+  }
+  let ndirX = dirX, ndirY = dirY;
+  if (Math.abs(b.spinSide) > 0.5 && newSpeed > 0.5 && speed > 0.001) {
+    const curveAmt = b.spinSide * CURVE_FACTOR * dt * 60;
+    ndirX = dirX - dirY * curveAmt; ndirY = dirY + dirX * curveAmt;
+    const nlen = Math.hypot(ndirX, ndirY) || 1;
+    ndirX /= nlen; ndirY /= nlen;
+  }
+  b.vx = ndirX * newSpeed; b.vy = ndirY * newSpeed;
+  b.spinTop = newSpinTop;
+  b.spinSide *= Math.exp(-SPIN_SIDE_DECAY * dt);
+  if (Math.abs(b.spinSide) < 0.05) b.spinSide = 0;
+  if (newSpeed < MIN_SPEED && Math.abs(b.spinTop) < MIN_SPEED) { b.vx = 0; b.vy = 0; b.spinTop = 0; }
+}
+// A struck ball that ends a collision nearly stopped but still holding real spin visibly continues
+// forward (follow, positive spinTop) or rolls back (draw, negative spinTop) — the dramatic case players
+// expect from english. Deliberately only fires near a near-stop; normal shots are unaffected.
+function applyDrawFollowKick(b, dirX, dirY) {
+  const speed = Math.hypot(b.vx, b.vy);
+  if (speed > 12 || Math.abs(b.spinTop) < 8) return;
+  const kick = b.spinTop * 0.55;
+  b.vx += dirX * kick; b.vy += dirY * kick;
+  b.spinTop *= 0.35;
+}
 function stepPhysics(balls, dt, pocketR, frictionRate) {
   const events = [];
-  const decay = Math.exp(-frictionRate * dt);
   for (const b of balls) {
     b.x += b.vx * dt; b.y += b.vy * dt;
-    b.vx *= decay; b.vy *= decay;
-    if (Math.hypot(b.vx, b.vy) < MIN_SPEED) { b.vx = 0; b.vy = 0; }
+    applySpinFriction(b, dt, frictionRate);
   }
   const sunk = [];
   for (const b of balls) {
@@ -118,7 +168,15 @@ function stepPhysics(balls, dt, pocketR, frictionRate) {
     else if (b.x + b.r > TABLE_W) { b.x = TABLE_W - b.r; b.vx = -b.vx * REST_CUSHION; bounced = true; }
     if (b.y - b.r < 0) { b.y = b.r; b.vy = -b.vy * REST_CUSHION; bounced = true; }
     else if (b.y + b.r > TABLE_H) { b.y = TABLE_H - b.r; b.vy = -b.vy * REST_CUSHION; bounced = true; }
-    if (bounced) { const spd = Math.hypot(b.vx, b.vy); if (spd > 5) events.push({ type: "cushion", speed: spd }); }
+    if (bounced) {
+      const spd = Math.hypot(b.vx, b.vy);
+      if (Math.abs(b.spinSide) > 1 && spd > 0.5) {
+        const tx = -b.vy / spd, ty = b.vx / spd;
+        b.vx += tx * b.spinSide * CUSHION_SPIN_KICK; b.vy += ty * b.spinSide * CUSHION_SPIN_KICK;
+      }
+      b.spinSide *= 0.75; b.spinTop *= 0.85;
+      if (spd > 5) events.push({ type: "cushion", speed: spd });
+    }
   }
   for (let i = 0; i < live.length; i++) {
     for (let j = i + 1; j < live.length; j++) {
@@ -129,8 +187,16 @@ function stepPhysics(balls, dt, pocketR, frictionRate) {
         a.x -= nx * overlap / 2; a.y -= ny * overlap / 2; b2.x += nx * overlap / 2; b2.y += ny * overlap / 2;
         const relVel = (b2.vx - a.vx) * nx + (b2.vy - a.vy) * ny;
         if (relVel < 0) {
+          const preASpeed = Math.hypot(a.vx, a.vy), preBSpeed = Math.hypot(b2.vx, b2.vy);
+          const preADirX = preASpeed > 0.5 ? a.vx / preASpeed : nx, preADirY = preASpeed > 0.5 ? a.vy / preASpeed : ny;
+          const preBDirX = preBSpeed > 0.5 ? b2.vx / preBSpeed : -nx, preBDirY = preBSpeed > 0.5 ? b2.vy / preBSpeed : -ny;
           const impulse = -(1 + REST_BALL) * relVel / 2;
           a.vx -= impulse * nx; a.vy -= impulse * ny; b2.vx += impulse * nx; b2.vy += impulse * ny;
+          const tx = -ny, ty = nx;
+          if (Math.abs(a.spinSide) > 1) { b2.vx += tx * a.spinSide * THROW_FACTOR; b2.vy += ty * a.spinSide * THROW_FACTOR; }
+          if (Math.abs(b2.spinSide) > 1) { a.vx += tx * b2.spinSide * THROW_FACTOR; a.vy += ty * b2.spinSide * THROW_FACTOR; }
+          applyDrawFollowKick(a, preADirX, preADirY);
+          applyDrawFollowKick(b2, preBDirX, preBDirY);
           const impactSpeed = Math.abs(relVel);
           if (impactSpeed > 5) events.push({ type: "collision", num: a.isCue ? b2.num : a.num, impactSpeed });
         }
@@ -140,13 +206,31 @@ function stepPhysics(balls, dt, pocketR, frictionRate) {
   return { events, live };
 }
 
-// ── AUDIO (Web Audio tones — no navigator.vibrate on iOS Safari, so audio carries all "feel" cues) ──
-let audioCtx = null, humOsc = null, humGain = null;
+// ── AUDIO (Web Audio synthesis — no navigator.vibrate on iOS Safari, so audio carries all "feel" cues) ──
+// No external sample files are used (this environment's network policy blocks fetching third-party
+// audio assets), so realism here comes from layered noise-based synthesis, a synthesized "room" reverb
+// send, and per-hit random jitter (pitch/duration/gain) so repeated hits don't sound identical.
+let audioCtx = null, humOsc = null, humGain = null, reverbSend = null;
 function getCtx() {
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   if (audioCtx.state === "suspended") audioCtx.resume();
   return audioCtx;
 }
+function getReverbSend(ctx) {
+  if (reverbSend) return reverbSend;
+  const convolver = ctx.createConvolver();
+  const dur = 0.9, decayPow = 3.2;
+  const ir = ctx.createBuffer(2, Math.floor(ctx.sampleRate * dur), ctx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const data = ir.getChannelData(ch);
+    for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / data.length, decayPow);
+  }
+  convolver.buffer = ir;
+  reverbSend = ctx.createGain(); reverbSend.gain.value = 0.16;
+  reverbSend.connect(convolver).connect(ctx.destination);
+  return reverbSend;
+}
+const jitter = (base, pct) => base * (1 + (Math.random() * 2 - 1) * pct);
 function tone(freq, { duration = 0.15, type = "sine", peak = 0.25, attack = 0.005, glideTo = null } = {}) {
   try {
     const ctx = getCtx(), t0 = ctx.currentTime;
@@ -155,7 +239,7 @@ function tone(freq, { duration = 0.15, type = "sine", peak = 0.25, attack = 0.00
     const gain = ctx.createGain(); gain.gain.setValueAtTime(0, t0);
     gain.gain.linearRampToValueAtTime(peak, t0 + attack);
     gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
-    osc.connect(gain).connect(ctx.destination);
+    osc.connect(gain); gain.connect(ctx.destination); gain.connect(getReverbSend(ctx));
     osc.start(); osc.stop(t0 + duration + 0.02);
   } catch (e) { /* audio unavailable — game remains playable via visuals/TTS */ }
 }
@@ -166,27 +250,37 @@ function createNoiseBuffer(ctx, duration) {
   for (let i = 0; i < size; i++) data[i] = Math.random() * 2 - 1;
   return buffer;
 }
+function noiseBurst(t0, dur, { filterType = "bandpass", freq = 1500, q = 0.85, peak = 0.2 } = {}) {
+  try {
+    const ctx = getCtx();
+    const src = ctx.createBufferSource(); src.buffer = createNoiseBuffer(ctx, dur);
+    const filt = ctx.createBiquadFilter(); filt.type = filterType; filt.frequency.value = freq; filt.Q.value = q;
+    const gain = ctx.createGain(); gain.gain.setValueAtTime(peak, t0); gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    src.connect(filt).connect(gain); gain.connect(ctx.destination); gain.connect(getReverbSend(ctx));
+    src.start(t0); src.stop(t0 + dur + 0.01);
+  } catch (e) { /* ignore */ }
+}
 const ballFreq = n => 220 * Math.pow(2, ((n || 1) - 1) / 7);
 function playCueStrike(power) {
-  try {
-    const ctx = getCtx(), t0 = ctx.currentTime;
-    // bright noise "crack" — the cue tip's transient contact with the ball
-    const crackDur = 0.045;
-    const noiseSrc = ctx.createBufferSource(); noiseSrc.buffer = createNoiseBuffer(ctx, crackDur);
-    const bandpass = ctx.createBiquadFilter(); bandpass.type = "bandpass";
-    bandpass.frequency.setValueAtTime(1700 + power * 1600, t0); bandpass.Q.value = 0.85;
-    const crackGain = ctx.createGain();
-    crackGain.gain.setValueAtTime(0.24 + power * 0.3, t0);
-    crackGain.gain.exponentialRampToValueAtTime(0.001, t0 + crackDur);
-    noiseSrc.connect(bandpass).connect(crackGain).connect(ctx.destination);
-    noiseSrc.start(t0); noiseSrc.stop(t0 + crackDur + 0.01);
-  } catch (e) { /* ignore */ }
-  // low body "thump" underneath so it doesn't sound thin
-  tone(95, { duration: 0.07, type: "sine", peak: 0.1 + 0.14 * power, glideTo: 55 });
+  const ctx = getCtx(), t0 = ctx.currentTime;
+  noiseBurst(t0, 0.045, { filterType: "bandpass", freq: jitter(1700 + power * 1600, 0.08), q: 0.85, peak: jitter(0.24 + power * 0.3, 0.1) });
+  tone(jitter(95, 0.04), { duration: 0.07, type: "sine", peak: 0.1 + 0.14 * power, glideTo: 55 });
 }
-const playCollision = (num, impactSpeed) => tone(ballFreq(num), { duration: 0.09, type: "triangle", peak: Math.min(0.35, 0.12 + impactSpeed / 300) });
-const playCushion = speed => tone(140, { duration: 0.11, type: "sine", peak: Math.min(0.25, 0.08 + speed / 400), glideTo: 100 });
-const playPocketSink = num => tone(ballFreq(num), { duration: 0.22, type: "sine", peak: 0.3, glideTo: ballFreq(num) * 2 });
+function playCollision(num, impactSpeed) {
+  const ctx = getCtx(), t0 = ctx.currentTime;
+  tone(jitter(ballFreq(num), 0.03), { duration: jitter(0.09, 0.15), type: "triangle", peak: Math.min(0.35, 0.12 + impactSpeed / 300) });
+  noiseBurst(t0, 0.02, { filterType: "highpass", freq: jitter(3400, 0.15), q: 0.7, peak: Math.min(0.18, 0.05 + impactSpeed / 500) });
+}
+function playCushion(speed) {
+  const ctx = getCtx(), t0 = ctx.currentTime;
+  tone(jitter(130, 0.08), { duration: jitter(0.11, 0.15), type: "sine", peak: Math.min(0.25, 0.08 + speed / 400), glideTo: 95 });
+  noiseBurst(t0, 0.06, { filterType: "lowpass", freq: 600, q: 0.6, peak: Math.min(0.16, 0.05 + speed / 500) });
+}
+function playPocketSink(num) {
+  const ctx = getCtx(), t0 = ctx.currentTime, f = ballFreq(num);
+  tone(f, { duration: 0.22, type: "sine", peak: 0.3, glideTo: f * 2 });
+  noiseBurst(t0 + 0.05, 0.32, { filterType: "bandpass", freq: 480, q: 0.55, peak: 0.09 });
+}
 function startHum() {
   try {
     const ctx = getCtx();
@@ -239,6 +333,13 @@ function drawBall(ctx, x, y, r, b) {
   ctx.restore();
 }
 
+function SpinButton({ active, onClick, icon, label }) {
+  return (<button onClick={onClick} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, width: 66, padding: "10px 4px", fontSize: 22, borderRadius: 12, background: active ? GOLD : "#1e293b", color: active ? BG : "#e2e8f0", border: `2px solid ${active ? GOLD : "#334155"}`, cursor: "pointer" }}>
+    <span>{icon}</span>
+    <span style={{ fontSize: 11, fontWeight: "bold" }}>{label}</span>
+  </button>);
+}
+
 // ── COMPONENT ─────────────────────────────────────────────────────────────────
 export default function PoolGame({ onBack }) {
   const [screen, setScreen] = useState("home");
@@ -251,6 +352,8 @@ export default function PoolGame({ onBack }) {
     const saved = typeof localStorage !== "undefined" ? localStorage.getItem("poolAudioGuide") : null;
     return saved === null ? true : saved === "true";
   });
+  const [strikeV, setStrikeV] = useState("center");
+  const [strikeH, setStrikeH] = useState("center");
 
   const canvasRef = useRef(null), hudRef = useRef(null), powerMeterRef = useRef(null);
   const ballsRef = useRef([]);
@@ -345,6 +448,7 @@ export default function PoolGame({ onBack }) {
     shotsCountRef.current = 0; setShots(0);
     sessionStartRef.current = Date.now();
     roundOverRef.current = false;
+    setStrikeV("center"); setStrikeH("center");
     setStatusMsg(`Sink the 1 ball first — drag anywhere on the table to aim.`);
     requestAnimationFrame(draw);
   }
@@ -385,6 +489,10 @@ export default function PoolGame({ onBack }) {
     const cue = ballsRef.current.find(b => b.isCue); if (!cue) return;
     const speed = aim.power * MAX_SHOT_SPEED;
     cue.vx = aim.dirX * speed; cue.vy = aim.dirY * speed;
+    const vOffset = strikeV === "top" ? 1 : strikeV === "bottom" ? -1 : 0;
+    const hOffset = strikeH === "right" ? 1 : strikeH === "left" ? -1 : 0;
+    cue.spinTop = vOffset * speed * SPIN_TOP_FACTOR;
+    cue.spinSide = hOffset * speed * SPIN_SIDE_FACTOR;
     playCueStrike(aim.power);
     shotsCountRef.current += 1; setShots(shotsCountRef.current);
     shotEventsRef.current = [];
@@ -536,6 +644,24 @@ export default function PoolGame({ onBack }) {
           <div ref={hudRef} style={{ position: "absolute", pointerEvents: "none", background: "rgba(15,23,42,0.9)", border: `2px solid ${GOLD}`, borderRadius: 12, padding: "8px 14px", color: "#fff", fontSize: 16, fontWeight: "bold", whiteSpace: "nowrap", maxWidth: "80%", overflow: "hidden", textOverflow: "ellipsis", textAlign: "center" }}>{statusMsg}</div>
           <div ref={powerMeterRef} style={{ position: "absolute", display: "none", width: 120, height: 14, background: "#1e293b", border: "2px solid #334155", borderRadius: 8, transform: "translate(-50%,0)", overflow: "hidden", pointerEvents: "none" }}>
             <div className="fill" style={{ height: "100%", width: "0%", background: `linear-gradient(90deg,#22c55e,${GOLD},#ef4444)` }} />
+          </div>
+        </div>
+        <div style={{ display: "flex", justifyContent: "center", gap: 28, marginBottom: 14, flexWrap: "wrap" }}>
+          <div>
+            <p style={{ color: "#7dd3fc", fontSize: 13, fontWeight: "bold", textAlign: "center", marginBottom: 6, letterSpacing: 1 }}>SPIN — UP/DOWN</p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <SpinButton active={strikeV === "top"} onClick={() => setStrikeV(strikeV === "top" ? "center" : "top")} icon="⬆️" label="Follow" />
+              <SpinButton active={strikeV === "center"} onClick={() => setStrikeV("center")} icon="⏺" label="Center" />
+              <SpinButton active={strikeV === "bottom"} onClick={() => setStrikeV(strikeV === "bottom" ? "center" : "bottom")} icon="⬇️" label="Draw" />
+            </div>
+          </div>
+          <div>
+            <p style={{ color: "#7dd3fc", fontSize: 13, fontWeight: "bold", textAlign: "center", marginBottom: 6, letterSpacing: 1 }}>SPIN — LEFT/RIGHT</p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <SpinButton active={strikeH === "left"} onClick={() => setStrikeH(strikeH === "left" ? "center" : "left")} icon="⬅️" label="Left" />
+              <SpinButton active={strikeH === "center"} onClick={() => setStrikeH("center")} icon="⏺" label="Center" />
+              <SpinButton active={strikeH === "right"} onClick={() => setStrikeH(strikeH === "right" ? "center" : "right")} icon="➡️" label="Right" />
+            </div>
           </div>
         </div>
         <p style={{ color: LIGHT, fontSize: 17, fontWeight: "bold", textAlign: "center" }}>Drag anywhere on the table, pull back from the cue ball, and release to shoot.</p>
