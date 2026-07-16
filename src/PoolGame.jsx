@@ -33,7 +33,7 @@ const BALL_STYLES = [
   { color: "#E066B3", stripe: false }, // 9
 ];
 
-const POOL_TTS = `Welcome to Table Pool. Drag your finger anywhere on the table, pull back from the cue ball, and let go to take your shot — the further you pull back, the harder you'll hit. A thick line shows exactly where the ball will go, and a rising tone helps you line up a pocket by ear. Sink the balls in order, starting with number one. There's no clock, and no penalty for missing — take all the time you need. Choose your difficulty below, then tap Start Game when you're ready.`;
+const POOL_TTS = `Welcome to Table Pool. Drag your finger anywhere on the table, pull back from the cue ball, and let go to take your shot — the further you pull back, the harder you'll hit. A thick line shows exactly where the ball will go, and a rising tone helps you line up a pocket by ear. If you'd rather play without that, there's an audio guide toggle below to turn it off any time. Sink the balls in order, starting with number one. There's no clock, and no penalty for missing — take all the time you need. Choose your difficulty below, then tap Start Game when you're ready.`;
 const POOL_BYE = `Well played — the table's clear. That's real spatial thinking and planning, shot after shot. Come back whenever you'd like another game.`;
 
 // ── PROJECTION (elevated overhead view) ──────────────────────────────────────
@@ -159,8 +159,31 @@ function tone(freq, { duration = 0.15, type = "sine", peak = 0.25, attack = 0.00
     osc.start(); osc.stop(t0 + duration + 0.02);
   } catch (e) { /* audio unavailable — game remains playable via visuals/TTS */ }
 }
+function createNoiseBuffer(ctx, duration) {
+  const size = Math.max(1, Math.floor(ctx.sampleRate * duration));
+  const buffer = ctx.createBuffer(1, size, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < size; i++) data[i] = Math.random() * 2 - 1;
+  return buffer;
+}
 const ballFreq = n => 220 * Math.pow(2, ((n || 1) - 1) / 7);
-const playCueStrike = power => tone(180, { duration: 0.09, type: "square", peak: 0.12 + 0.15 * power, glideTo: 90 });
+function playCueStrike(power) {
+  try {
+    const ctx = getCtx(), t0 = ctx.currentTime;
+    // bright noise "crack" — the cue tip's transient contact with the ball
+    const crackDur = 0.045;
+    const noiseSrc = ctx.createBufferSource(); noiseSrc.buffer = createNoiseBuffer(ctx, crackDur);
+    const bandpass = ctx.createBiquadFilter(); bandpass.type = "bandpass";
+    bandpass.frequency.setValueAtTime(1700 + power * 1600, t0); bandpass.Q.value = 0.85;
+    const crackGain = ctx.createGain();
+    crackGain.gain.setValueAtTime(0.24 + power * 0.3, t0);
+    crackGain.gain.exponentialRampToValueAtTime(0.001, t0 + crackDur);
+    noiseSrc.connect(bandpass).connect(crackGain).connect(ctx.destination);
+    noiseSrc.start(t0); noiseSrc.stop(t0 + crackDur + 0.01);
+  } catch (e) { /* ignore */ }
+  // low body "thump" underneath so it doesn't sound thin
+  tone(95, { duration: 0.07, type: "sine", peak: 0.1 + 0.14 * power, glideTo: 55 });
+}
 const playCollision = (num, impactSpeed) => tone(ballFreq(num), { duration: 0.09, type: "triangle", peak: Math.min(0.35, 0.12 + impactSpeed / 300) });
 const playCushion = speed => tone(140, { duration: 0.11, type: "sine", peak: Math.min(0.25, 0.08 + speed / 400), glideTo: 100 });
 const playPocketSink = num => tone(ballFreq(num), { duration: 0.22, type: "sine", peak: 0.3, glideTo: ballFreq(num) * 2 });
@@ -224,6 +247,10 @@ export default function PoolGame({ onBack }) {
   const [sunkNumbers, setSunkNumbers] = useState([]);
   const [shots, setShots] = useState(0);
   const [statusMsg, setStatusMsg] = useState("");
+  const [audioGuideOn, setAudioGuideOn] = useState(() => {
+    const saved = typeof localStorage !== "undefined" ? localStorage.getItem("poolAudioGuide") : null;
+    return saved === null ? true : saved === "true";
+  });
 
   const canvasRef = useRef(null), hudRef = useRef(null), powerMeterRef = useRef(null);
   const ballsRef = useRef([]);
@@ -333,7 +360,7 @@ export default function PoolGame({ onBack }) {
     if (pullDist > 0.001) { dirX = -pullX / pullDist; dirY = -pullY / pullDist; }
     const power = Math.min(pullDist, MAX_PULL) / MAX_PULL;
     aimStateRef.current = { dirX, dirY, power, pullDist };
-    updateHum(humFreqForAim(cue.x, cue.y, dirX, dirY));
+    if (audioGuideOn) updateHum(humFreqForAim(cue.x, cue.y, dirX, dirY));
     draw();
   }
 
@@ -342,7 +369,7 @@ export default function PoolGame({ onBack }) {
     const canvas = canvasRef.current; if (!canvas) return;
     canvas.setPointerCapture(e.pointerId);
     aimRef.current = { active: true, pointerId: e.pointerId };
-    startHum();
+    if (audioGuideOn) startHum();
     updatePointer(e.clientX, e.clientY);
   }
   function pointerMove(e) {
@@ -413,7 +440,7 @@ export default function PoolGame({ onBack }) {
     if (remaining.length === 0) {
       msg = "🎉 Table cleared — every ball is in!";
       setStatusMsg(msg); roundOverRef.current = true;
-      speakText(msg, null, null);
+      if (audioGuideOn) speakText(msg, null, null);
       finalizeSession();
       return;
     }
@@ -422,7 +449,7 @@ export default function PoolGame({ onBack }) {
     else if (newlySunkNums.length) msg = `That wasn't the ${prevTarget} ball, but no penalty — the ${prevTarget} ball is still what you're after.`;
     else msg = `Line up your next shot for the ${prevTarget} ball.`;
     setStatusMsg(msg);
-    speakText(msg, null, null);
+    if (audioGuideOn) speakText(msg, null, null);
   }
 
   function finalizeSession() {
@@ -452,6 +479,11 @@ export default function PoolGame({ onBack }) {
     window.speechSynthesis?.cancel();
   }, []);
 
+  useEffect(() => {
+    try { localStorage.setItem("poolAudioGuide", String(audioGuideOn)); } catch (e) {}
+    if (!audioGuideOn) stopHum();
+  }, [audioGuideOn]);
+
   // ── SCREENS ─────────────────────────────────────────────────────────────────
   if (screen === "home") return (
     <div style={center}><div style={{ maxWidth: 640, width: "100%", textAlign: "center" }}>
@@ -466,6 +498,11 @@ export default function PoolGame({ onBack }) {
             return (<button key={key} onClick={() => setDifficulty(key)} style={{ background: active ? GOLD : "#0f172a", color: active ? BG : "#e2e8f0", border: `2px solid ${active ? GOLD : "#334155"}`, borderRadius: 14, padding: "16px 18px", fontSize: 19, fontWeight: "bold", textAlign: "left", cursor: "pointer" }}>{d.label} — <span style={{ fontWeight: "normal" }}>{d.desc}</span></button>);
           })}
         </div>
+      </div>
+      <div style={{ ...card, textAlign: "left", marginBottom: 20 }}>
+        <p style={{ color: "#7dd3fc", fontSize: 17, fontWeight: "bold", marginBottom: 8 }}>AUDIO GUIDE</p>
+        <p style={{ color: LIGHT, fontSize: 17, fontWeight: "bold", marginBottom: 12 }}>A rising tone while you aim, plus spoken updates after each shot. You can turn this off any time — the ball, cue, and pocket sounds stay on either way.</p>
+        <button onClick={() => setAudioGuideOn(v => !v)} style={{ background: audioGuideOn ? GOLD : "#0f172a", color: audioGuideOn ? BG : "#e2e8f0", border: `2px solid ${audioGuideOn ? GOLD : "#334155"}`, borderRadius: 14, padding: "16px 18px", fontSize: 19, fontWeight: "bold", cursor: "pointer", width: "100%" }}>{audioGuideOn ? "🔊 Audio Guide: On — tap to turn off" : "🔇 Audio Guide: Off — tap to turn on"}</button>
       </div>
       <AudioButton text={POOL_TTS} large />
       <p style={{ color: LIGHT, fontSize: 19, fontWeight: "bold", marginBottom: 20 }}>We'll walk you through everything before you start.</p>
@@ -488,7 +525,10 @@ export default function PoolGame({ onBack }) {
             <span style={{ color: GOLD, fontSize: 17, fontWeight: "bold" }}>{DIFFICULTIES[difficulty].label} · 🎯 Target: {targetNum ?? "—"}</span>
             <span style={{ color: LIGHT, fontSize: 16, fontWeight: "bold", display: "block" }}>Shots: {shots} · Sunk: {sunkNumbers.length}/{ballCount}</span>
           </div>
-          <button onClick={() => setupTable(difficulty)} style={{ background: "#1e293b", color: LIGHT, border: "1px solid #334155", borderRadius: 10, padding: "10px 18px", fontSize: 15, fontWeight: "bold", cursor: "pointer" }}>🔄 Reset</button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => setAudioGuideOn(v => !v)} aria-label="Toggle audio guide" style={{ background: "#1e293b", color: LIGHT, border: "1px solid #334155", borderRadius: 10, padding: "10px 14px", fontSize: 15, fontWeight: "bold", cursor: "pointer" }}>{audioGuideOn ? "🔊" : "🔇"}</button>
+            <button onClick={() => setupTable(difficulty)} style={{ background: "#1e293b", color: LIGHT, border: "1px solid #334155", borderRadius: 10, padding: "10px 18px", fontSize: 15, fontWeight: "bold", cursor: "pointer" }}>🔄 Reset</button>
+          </div>
         </div>
         <div style={{ position: "relative", width: "100%", maxWidth: 900, aspectRatio: "2/1", margin: "0 auto 16px", borderRadius: 20, overflow: "hidden", touchAction: "none", background: "#000", border: "2px solid #334155" }}>
           <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block", touchAction: "none" }}
