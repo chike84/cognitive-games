@@ -35,6 +35,19 @@ export const goldBtn={background:GOLD,color:BG,fontSize:22,fontWeight:"bold",pad
 export const card={background:"#1e293b",borderRadius:16,padding:"20px 24px",border:"1px solid #334155",marginBottom:16};
 export const StarRow=({count,size=24})=><div style={{display:"flex",gap:3}}>{[1,2,3].map(i=><span key={i} style={{fontSize:size,filter:i<=count?"none":"grayscale(1) opacity(0.2)"}}>⭐</span>)}</div>;
 
+// ── Pixel-art design tokens (additive — used by games opting into the retro/pixel style) ──
+export const PX_INK="#0a0a12",PX_PAPER="#1b1b2f",PX_RED="#e2453c",PX_GREEN="#3ecf5b",PX_BLUE="#4fc3f7";
+export const PX_PALETTE=[PX_INK,"#f8fafc",PX_RED,PX_GREEN,PX_BLUE,GOLD];
+export const PIXEL_FONT='"Courier New",monospace';
+export const pixelBorder=(color=PX_INK,size=4)=>({border:`${size}px solid ${color}`,borderRadius:0,boxShadow:`${size}px ${size}px 0 0 ${PX_INK}`});
+export const pixelCard={background:PX_PAPER,...pixelBorder(PX_INK,4),padding:"20px 24px",marginBottom:16};
+export const pixelBtn={background:GOLD,color:BG,fontFamily:PIXEL_FONT,fontWeight:900,letterSpacing:1,textTransform:"uppercase",fontSize:20,padding:"20px 48px",cursor:"pointer",...pixelBorder(PX_INK,4)};
+export const pixelBtnGhost={background:PX_PAPER,color:"#7dd3fc",fontFamily:PIXEL_FONT,fontWeight:900,letterSpacing:1,textTransform:"uppercase",fontSize:15,padding:"12px 20px",cursor:"pointer",...pixelBorder("#334155",3)};
+export const PixelLabel={fontFamily:PIXEL_FONT,fontWeight:700,letterSpacing:1};
+export function PixelHeading({children,size=36,color=GOLD,style={}}){
+  return <h1 style={{fontFamily:PIXEL_FONT,fontWeight:900,letterSpacing:2,fontSize:size,color,textShadow:`3px 3px 0 ${PX_INK}`,margin:0,...style}}>{children}</h1>;
+}
+
 export function FeedbackScreen({onBack,gameName,table}){
   const[ease,setEase]=useState(0),[enjoy,setEnjoy]=useState(0),[done,setDone]=useState(false);
   const eL=["Very Hard","Hard","OK","Easy","Very Easy"],eE=["😞","😐","🙂","😄","🤩"];
