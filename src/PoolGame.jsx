@@ -25,6 +25,15 @@ const DIFFICULTIES = {
   hard:   { label: "Hard",   count: 9, pocketMult: 1.0,  frictionMult: 1.0,  desc: "9 balls · full challenge" },
 };
 
+// AI opponent shot-selection is a geometric heuristic (best makable pocket for the target ball, with
+// obstruction checks), not a learned/trained model. Difficulty is simulated with aim/power error and
+// how often the AI picks its best option vs. a worse one — not by literally seeing less of the table.
+const AI_DIFFICULTIES = {
+  beginner:     { label: "Beginner",     aimErrorDeg: 11,  powerNoise: 0.30, bestShotChance: 0.45, desc: "Makes plenty of mistakes — a relaxed, forgiving match" },
+  intermediate: { label: "Intermediate", aimErrorDeg: 5,   powerNoise: 0.15, bestShotChance: 0.75, desc: "Solid, fairly consistent shot-making" },
+  hard:         { label: "Hard",         aimErrorDeg: 1.5, powerNoise: 0.06, bestShotChance: 0.95, desc: "Rarely misses a good shot — a real challenge" },
+};
+
 // Colorblind-safe, high-contrast "neon" ball styling — numeral + solid/stripe is the primary identifier, hue is secondary.
 const BALL_STYLES = [
   { color: "#FF5A36", stripe: false }, // 1
@@ -38,8 +47,10 @@ const BALL_STYLES = [
   { color: "#E066B3", stripe: false }, // 9
 ];
 
-const POOL_TTS = `Welcome to Table Pool. Drag your finger anywhere on the table, pull back from the cue ball, and let go to take your shot — the further you pull back, the harder you'll hit. A thick line shows exactly where the ball will go, and a rising tone helps you line up a pocket by ear. If you'd rather play without that, there's an audio guide toggle below to turn it off any time. Once you're in a game, you'll also see spin buttons below the table — tap Follow or Draw to make the cue ball roll forward or pull back after it hits another ball, or Left or Right to curve its path. Leave them on Center for a plain, straightforward shot. Sink the balls in order, starting with number one. There's no clock, and no penalty for missing — take all the time you need. Choose your difficulty below, then tap Start Game when you're ready.`;
+const POOL_TTS = `Welcome to Table Pool. Drag your finger anywhere on the table, pull back from the cue ball, and let go to take your shot — the further you pull back, the harder you'll hit. A thick line shows exactly where the ball will go, and a rising tone helps you line up a pocket by ear. If you'd rather play without that, there's an audio guide toggle below to turn it off any time. Once you're in a game, you'll also see spin buttons below the table — tap Follow or Draw to make the cue ball roll forward or pull back after it hits another ball, or Left or Right to curve its path. Leave them on Center for a plain, straightforward shot. Sink the balls in order, starting with number one. There's no clock, and no penalty for missing — take all the time you need. You can also play solo or against an opponent — if you choose an opponent, you'll take turns: sinking your ball keeps your turn, missing passes it over, and whoever sinks the very last ball wins. Choose your options below, then tap Start Game when you're ready.`;
 const POOL_BYE = `Well played — the table's clear. That's real spatial thinking and planning, shot after shot. Come back whenever you'd like another game.`;
+const POOL_BYE_WIN = `Great match — you win! That's real shot-making under pressure. Come back whenever you'd like a rematch.`;
+const POOL_BYE_LOSE = `Good match — the opponent takes this one. Every game sharpens your eye. Come back whenever you're ready to try again.`;
 
 // ── PROJECTION (elevated overhead view) ──────────────────────────────────────
 function getProjection(w, h) {
@@ -98,6 +109,65 @@ function computeAimEndpoint(cueX, cueY, dirX, dirY, balls) {
   }
   if (!isFinite(best) || best < 0) best = 0;
   return { x: cueX + dirX * best, y: cueY + dirY * best };
+}
+
+// ── AI OPPONENT ────────────────────────────────────────────────────────────────
+// Is the straight segment (x1,y1)-(x2,y2) clear of every ball not in excludeIds, within clearRadius?
+function segmentClearOfBalls(x1, y1, x2, y2, balls, excludeIds, clearRadius) {
+  const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy);
+  if (len < 0.001) return true;
+  const ux = dx / len, uy = dy / len;
+  for (const b of balls) {
+    if (excludeIds.has(b.id)) continue;
+    const px = b.x - x1, py = b.y - y1;
+    const t = Math.max(0, Math.min(len, px * ux + py * uy));
+    const cx = x1 + ux * t, cy = y1 + uy * t;
+    if (Math.hypot(b.x - cx, b.y - cy) < clearRadius) return false;
+  }
+  return true;
+}
+// Geometric heuristic, not a trained model: for each pocket, compute the "ghost ball" aim point that
+// would send the target ball there, skip pockets with too sharp a cut or a blocked path, then rank the
+// rest by cut angle + distance. Difficulty controls aim/power error and how often the best option is used.
+function computeAIShot(balls, targetNum, aiDiffKey) {
+  const cfg = AI_DIFFICULTIES[aiDiffKey];
+  const cue = balls.find(b => b.isCue);
+  const target = balls.find(b => !b.isCue && b.num === targetNum);
+  if (!cue || !target) return null;
+  const candidates = [];
+  for (const p of POCKETS) {
+    const pdx = p.x - target.x, pdy = p.y - target.y, pdist = Math.hypot(pdx, pdy);
+    if (pdist < 0.01) continue;
+    const pux = pdx / pdist, puy = pdy / pdist;
+    const ghostX = target.x - pux * (BALL_R * 2), ghostY = target.y - puy * (BALL_R * 2);
+    const cdx = ghostX - cue.x, cdy = ghostY - cue.y, cdist = Math.hypot(cdx, cdy);
+    if (cdist < 0.01) continue;
+    const cux = cdx / cdist, cuy = cdy / cdist;
+    const cutAngle = Math.acos(Math.max(-1, Math.min(1, cux * pux + cuy * puy)));
+    if (cutAngle > Math.PI * 0.47) continue; // ~85°, near-impossible cut — skip
+    if (!segmentClearOfBalls(cue.x, cue.y, ghostX, ghostY, balls, new Set([cue.id, target.id]), BALL_R * 1.8)) continue;
+    if (!segmentClearOfBalls(target.x, target.y, p.x, p.y, balls, new Set([target.id, cue.id]), BALL_R * 1.6)) continue;
+    candidates.push({ dirX: cux, dirY: cuy, cdist, pdist, score: -cutAngle * 2 - (cdist + pdist) * 0.01 });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  let chosen;
+  if (candidates.length === 0) {
+    const dx = target.x - cue.x, dy = target.y - cue.y, dist = Math.hypot(dx, dy) || 1;
+    chosen = { dirX: dx / dist, dirY: dy / dist, cdist: dist, pdist: 40 };
+  } else if (candidates.length === 1 || Math.random() < cfg.bestShotChance) {
+    chosen = candidates[0];
+  } else {
+    chosen = candidates[1 + Math.floor(Math.random() * (candidates.length - 1))];
+  }
+  const errRad = (Math.random() * 2 - 1) * cfg.aimErrorDeg * Math.PI / 180;
+  const cosE = Math.cos(errRad), sinE = Math.sin(errRad);
+  const dirX = chosen.dirX * cosE - chosen.dirY * sinE;
+  const dirY = chosen.dirX * sinE + chosen.dirY * cosE;
+  const totalDist = chosen.cdist + chosen.pdist;
+  let power = Math.min(1, Math.max(0.35, totalDist / 140));
+  power *= 1 + (Math.random() * 2 - 1) * cfg.powerNoise;
+  power = Math.min(1, Math.max(0.25, power));
+  return { dirX, dirY, power };
 }
 
 // ── PHYSICS STEP ──────────────────────────────────────────────────────────────
@@ -354,6 +424,9 @@ export default function PoolGame({ onBack }) {
   });
   const [strikeV, setStrikeV] = useState("center");
   const [strikeH, setStrikeH] = useState("center");
+  const [mode, setMode] = useState("solo");
+  const [aiDifficulty, setAiDifficulty] = useState("beginner");
+  const [turn, setTurn] = useState("player");
 
   const canvasRef = useRef(null), hudRef = useRef(null), powerMeterRef = useRef(null);
   const ballsRef = useRef([]);
@@ -364,6 +437,8 @@ export default function PoolGame({ onBack }) {
   const shotEventsRef = useRef([]);
   const sunkNumbersRef = useRef([]), targetRef = useRef(1), shotsCountRef = useRef(0);
   const sessionStartRef = useRef(Date.now());
+  const turnRef = useRef("player"), lastSinkerRef = useRef(null);
+  const aiTurnTimeoutsRef = useRef([]);
 
   const ballCount = DIFFICULTIES[difficulty].count;
 
@@ -440,7 +515,13 @@ export default function PoolGame({ onBack }) {
     }
   }
 
+  function clearAITimeouts() {
+    for (const id of aiTurnTimeoutsRef.current) clearTimeout(id);
+    aiTurnTimeoutsRef.current = [];
+  }
+
   function setupTable(diffKey) {
+    clearAITimeouts();
     const diff = DIFFICULTIES[diffKey];
     ballsRef.current = [...makeRack(diff.count), makeCue()];
     sunkNumbersRef.current = []; setSunkNumbers([]);
@@ -448,8 +529,10 @@ export default function PoolGame({ onBack }) {
     shotsCountRef.current = 0; setShots(0);
     sessionStartRef.current = Date.now();
     roundOverRef.current = false;
+    turnRef.current = "player"; setTurn("player");
+    lastSinkerRef.current = null;
     setStrikeV("center"); setStrikeH("center");
-    setStatusMsg(`Sink the 1 ball first — drag anywhere on the table to aim.`);
+    setStatusMsg(mode === "vsAI" ? `Your turn — sink the 1 ball first.` : `Sink the 1 ball first — drag anywhere on the table to aim.`);
     requestAnimationFrame(draw);
   }
 
@@ -470,6 +553,7 @@ export default function PoolGame({ onBack }) {
 
   function pointerDown(e) {
     if (screen !== "game" || animatingRef.current || roundOverRef.current) return;
+    if (mode === "vsAI" && turnRef.current !== "player") return;
     const canvas = canvasRef.current; if (!canvas) return;
     canvas.setPointerCapture(e.pointerId);
     aimRef.current = { active: true, pointerId: e.pointerId };
@@ -529,13 +613,43 @@ export default function PoolGame({ onBack }) {
     else { animatingRef.current = false; finalizeShot(shotEventsRef.current); shotEventsRef.current = []; }
   }
 
+  function scheduleAITurn() {
+    setStatusMsg("Opponent's turn — lining up...");
+    if (audioGuideOn) speakText("Opponent's turn.", null, null);
+    const t1 = setTimeout(() => {
+      const shot = computeAIShot(ballsRef.current, targetRef.current, aiDifficulty);
+      if (!shot) return;
+      aimStateRef.current = { dirX: shot.dirX, dirY: shot.dirY, power: shot.power, pullDist: MAX_PULL };
+      draw();
+      const t2 = setTimeout(() => fireAIShot(shot), 900);
+      aiTurnTimeoutsRef.current.push(t2);
+    }, 700);
+    aiTurnTimeoutsRef.current.push(t1);
+  }
+
+  function fireAIShot(shot) {
+    aimStateRef.current = null;
+    const cue = ballsRef.current.find(b => b.isCue); if (!cue) return;
+    const speed = shot.power * MAX_SHOT_SPEED;
+    cue.vx = shot.dirX * speed; cue.vy = shot.dirY * speed;
+    cue.spinTop = 0; cue.spinSide = 0;
+    playCueStrike(shot.power);
+    shotsCountRef.current += 1; setShots(shotsCountRef.current);
+    shotEventsRef.current = [];
+    startAnimation();
+  }
+
   function finalizeShot(events) {
     const prevTarget = targetRef.current;
+    const shooter = turnRef.current;
     const sunkEvents = events.filter(e => e.type === "pocket");
     const cueSunk = sunkEvents.some(e => e.isCue);
     const newlySunkNums = sunkEvents.filter(e => !e.isCue).map(e => e.num);
     let sunkList = sunkNumbersRef.current;
-    if (newlySunkNums.length) { sunkList = [...sunkList, ...newlySunkNums]; sunkNumbersRef.current = sunkList; setSunkNumbers(sunkList); }
+    if (newlySunkNums.length) {
+      sunkList = [...sunkList, ...newlySunkNums]; sunkNumbersRef.current = sunkList; setSunkNumbers(sunkList);
+      lastSinkerRef.current = shooter;
+    }
     if (cueSunk) ballsRef.current = [...ballsRef.current, makeCue()];
 
     const remaining = [];
@@ -544,15 +658,51 @@ export default function PoolGame({ onBack }) {
     setTargetNum(newTarget); targetRef.current = newTarget;
     draw();
 
+    const sunkTarget = newlySunkNums.includes(prevTarget);
+    const continues = sunkTarget && !cueSunk;
     let msg;
+
     if (remaining.length === 0) {
-      msg = "🎉 Table cleared — every ball is in!";
-      setStatusMsg(msg); roundOverRef.current = true;
-      if (audioGuideOn) speakText(msg, null, null);
-      finalizeSession();
+      roundOverRef.current = true;
+      if (mode === "vsAI") {
+        const winner = lastSinkerRef.current;
+        msg = winner === "player" ? "🏆 You win! You sank the last ball." : "Opponent wins this round — they sank the last ball.";
+        setStatusMsg(msg);
+        if (audioGuideOn) speakText(msg, null, null);
+        finalizeSession(winner);
+      } else {
+        msg = "🎉 Table cleared — every ball is in!";
+        setStatusMsg(msg);
+        if (audioGuideOn) speakText(msg, null, null);
+        finalizeSession(null);
+      }
       return;
     }
-    if (newlySunkNums.includes(prevTarget)) msg = `Nice shot! The ${prevTarget} ball is in. Aim for the ${newTarget} ball next.`;
+
+    if (mode === "vsAI") {
+      if (continues) {
+        msg = shooter === "player"
+          ? `Nice shot! The ${prevTarget} ball is in. Aim for the ${newTarget} ball next.`
+          : `Opponent sinks the ${prevTarget} ball and keeps their turn — next up is the ${newTarget} ball.`;
+        setStatusMsg(msg);
+        if (audioGuideOn) speakText(msg, null, null);
+        if (shooter === "ai") scheduleAITurn();
+      } else {
+        const nextTurn = shooter === "player" ? "ai" : "player";
+        turnRef.current = nextTurn; setTurn(nextTurn);
+        if (shooter === "player") {
+          msg = cueSunk ? "Scratch — the cue ball went in. Opponent's turn." : newlySunkNums.length ? `That sinks the ${newlySunkNums[0]}, but not your target — opponent's turn.` : "Missed — opponent's turn.";
+        } else {
+          msg = cueSunk ? "Opponent scratched — the cue ball went in. Your turn!" : newlySunkNums.length ? "Opponent sank the wrong ball — your turn!" : "Opponent missed — your turn!";
+        }
+        setStatusMsg(msg);
+        if (audioGuideOn) speakText(msg, null, null);
+        if (nextTurn === "ai") scheduleAITurn();
+      }
+      return;
+    }
+
+    if (sunkTarget) msg = `Nice shot! The ${prevTarget} ball is in. Aim for the ${newTarget} ball next.`;
     else if (cueSunk) msg = "The cue ball went in — no penalty, it's back on the table. Aim when you're ready.";
     else if (newlySunkNums.length) msg = `That wasn't the ${prevTarget} ball, but no penalty — the ${prevTarget} ball is still what you're after.`;
     else msg = `Line up your next shot for the ${prevTarget} ball.`;
@@ -560,16 +710,26 @@ export default function PoolGame({ onBack }) {
     if (audioGuideOn) speakText(msg, null, null);
   }
 
-  function finalizeSession() {
+  function finalizeSession(winner) {
     const dur = Date.now() - sessionStartRef.current;
     const shotsN = shotsCountRef.current;
-    const stars = shotsN <= ballCount + 2 ? 3 : shotsN <= ballCount + 5 ? 2 : 1;
-    postToAirtable("Table Pool", {
-      Date: new Date().toLocaleDateString(), Time: new Date().toLocaleTimeString(), Game: "Table Pool", Type: "session",
-      Score: stars, Total: 3, "Duration (s)": Math.round(dur / 1000), Shots: shotsN, "Balls Sunk": ballCount,
-      Difficulty: DIFFICULTIES[difficulty].label, "Ease Rating": "—", "Enjoy Rating": "—", Platform: detectPlatform(),
-    });
-    setTimeout(() => speakText(POOL_BYE, null, null), 1800);
+    if (mode === "vsAI") {
+      postToAirtable("Table Pool", {
+        Date: new Date().toLocaleDateString(), Time: new Date().toLocaleTimeString(), Game: "Table Pool", Type: "session",
+        Score: winner === "player" ? 1 : 0, Total: 1, "Duration (s)": Math.round(dur / 1000), Shots: shotsN, "Balls Sunk": ballCount,
+        Difficulty: DIFFICULTIES[difficulty].label, Mode: "VS AI", "AI Difficulty": AI_DIFFICULTIES[aiDifficulty].label, Winner: winner,
+        "Ease Rating": "—", "Enjoy Rating": "—", Platform: detectPlatform(),
+      });
+      setTimeout(() => speakText(winner === "player" ? POOL_BYE_WIN : POOL_BYE_LOSE, null, null), 1800);
+    } else {
+      const stars = shotsN <= ballCount + 2 ? 3 : shotsN <= ballCount + 5 ? 2 : 1;
+      postToAirtable("Table Pool", {
+        Date: new Date().toLocaleDateString(), Time: new Date().toLocaleTimeString(), Game: "Table Pool", Type: "session",
+        Score: stars, Total: 3, "Duration (s)": Math.round(dur / 1000), Shots: shotsN, "Balls Sunk": ballCount,
+        Difficulty: DIFFICULTIES[difficulty].label, Mode: "Solo", "Ease Rating": "—", "Enjoy Rating": "—", Platform: detectPlatform(),
+      });
+      setTimeout(() => speakText(POOL_BYE, null, null), 1800);
+    }
     setTimeout(() => setScreen("done"), 2600);
   }
 
@@ -583,6 +743,7 @@ export default function PoolGame({ onBack }) {
 
   useEffect(() => () => {
     if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+    for (const id of aiTurnTimeoutsRef.current) clearTimeout(id);
     stopHum();
     window.speechSynthesis?.cancel();
   }, []);
@@ -598,6 +759,24 @@ export default function PoolGame({ onBack }) {
       <div style={{ fontSize: 64, marginBottom: 12 }}>🎱</div>
       <h1 style={{ fontSize: 36, fontWeight: "bold", color: GOLD, marginBottom: 10 }}>Table Pool</h1>
       <p style={{ fontSize: 22, color: LIGHT, fontWeight: "bold", marginBottom: 20, lineHeight: 1.5 }}>Drag to aim, plan your shot, and clear the table — a game of spatial reasoning and patience.</p>
+      <div style={{ ...card, textAlign: "left", marginBottom: 20 }}>
+        <p style={{ color: "#7dd3fc", fontSize: 17, fontWeight: "bold", marginBottom: 14 }}>GAME MODE</p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <button onClick={() => setMode("solo")} style={{ background: mode === "solo" ? GOLD : "#0f172a", color: mode === "solo" ? BG : "#e2e8f0", border: `2px solid ${mode === "solo" ? GOLD : "#334155"}`, borderRadius: 14, padding: "16px 18px", fontSize: 19, fontWeight: "bold", textAlign: "left", cursor: "pointer" }}>🎯 Solo — <span style={{ fontWeight: "normal" }}>Clear the table at your own pace</span></button>
+          <button onClick={() => setMode("vsAI")} style={{ background: mode === "vsAI" ? GOLD : "#0f172a", color: mode === "vsAI" ? BG : "#e2e8f0", border: `2px solid ${mode === "vsAI" ? GOLD : "#334155"}`, borderRadius: 14, padding: "16px 18px", fontSize: 19, fontWeight: "bold", textAlign: "left", cursor: "pointer" }}>🤖 VS Opponent — <span style={{ fontWeight: "normal" }}>Take turns, sink the last ball to win</span></button>
+        </div>
+      </div>
+      {mode === "vsAI" && (
+        <div style={{ ...card, textAlign: "left", marginBottom: 20 }}>
+          <p style={{ color: "#7dd3fc", fontSize: 17, fontWeight: "bold", marginBottom: 14 }}>OPPONENT DIFFICULTY</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {Object.entries(AI_DIFFICULTIES).map(([key, d]) => {
+              const active = aiDifficulty === key;
+              return (<button key={key} onClick={() => setAiDifficulty(key)} style={{ background: active ? GOLD : "#0f172a", color: active ? BG : "#e2e8f0", border: `2px solid ${active ? GOLD : "#334155"}`, borderRadius: 14, padding: "16px 18px", fontSize: 19, fontWeight: "bold", textAlign: "left", cursor: "pointer" }}>{d.label} — <span style={{ fontWeight: "normal" }}>{d.desc}</span></button>);
+            })}
+          </div>
+        </div>
+      )}
       <div style={{ ...card, textAlign: "left", marginBottom: 20 }}>
         <p style={{ color: "#7dd3fc", fontSize: 17, fontWeight: "bold", marginBottom: 14 }}>CHOOSE YOUR DIFFICULTY</p>
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -630,8 +809,12 @@ export default function PoolGame({ onBack }) {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
           <button onClick={onBack} style={{ background: "transparent", color: "#64748b", border: "1px solid #334155", borderRadius: 10, padding: "10px 18px", fontSize: 16, cursor: "pointer" }}>← Hub</button>
           <div style={{ textAlign: "center" }}>
-            <span style={{ color: GOLD, fontSize: 17, fontWeight: "bold" }}>{DIFFICULTIES[difficulty].label} · 🎯 Target: {targetNum ?? "—"}</span>
-            <span style={{ color: LIGHT, fontSize: 16, fontWeight: "bold", display: "block" }}>Shots: {shots} · Sunk: {sunkNumbers.length}/{ballCount}</span>
+            <span style={{ color: GOLD, fontSize: 17, fontWeight: "bold" }}>
+              {mode === "vsAI" ? (turn === "player" ? "🎯 Your Turn" : "🤖 Opponent's Turn") : DIFFICULTIES[difficulty].label} · Target: {targetNum ?? "—"}
+            </span>
+            <span style={{ color: LIGHT, fontSize: 16, fontWeight: "bold", display: "block" }}>
+              {mode === "vsAI" ? `${DIFFICULTIES[difficulty].label} · vs ${AI_DIFFICULTIES[aiDifficulty].label} · ` : ""}Shots: {shots} · Sunk: {sunkNumbers.length}/{ballCount}
+            </span>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
             <button onClick={() => setAudioGuideOn(v => !v)} aria-label="Toggle audio guide" style={{ background: "#1e293b", color: LIGHT, border: "1px solid #334155", borderRadius: 10, padding: "10px 14px", fontSize: 15, fontWeight: "bold", cursor: "pointer" }}>{audioGuideOn ? "🔊" : "🔇"}</button>
