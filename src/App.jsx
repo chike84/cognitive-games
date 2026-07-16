@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from "react";
 import PoolGame from "./PoolGame.jsx";
+import BowlingGame from "./BowlingGame.jsx";
 import { postToAirtable, detectPlatform, speakText, AudioButton, BG, GOLD, LIGHT, page, center, goldBtn, card, StarRow, FeedbackScreen } from "./shared.jsx";
 
 // ── HUB ───────────────────────────────────────────────────────────────────────
-const HUB_TTS=`Welcome to Cognitive Games. This is a suite of brain training games designed for sharp, curious minds of all ages. There are six games to choose from. Animal Diagnosis Challenge — clinical reasoning with real veterinary cases. Pattern Completion — visual logic puzzles across three levels. Veterinary Word Association — find the term that doesn't belong. What Would You Do — everyday decision-making stories. Memory Pair Match — a card matching memory game. And Table Pool — an accessible billiards game where you drag to aim and clear the table. Take your time, tap any game to begin, and enjoy.`;
+const HUB_TTS=`Welcome to Cognitive Games. This is a suite of brain training games designed for sharp, curious minds of all ages. There are seven games to choose from. Animal Diagnosis Challenge — clinical reasoning with real veterinary cases. Pattern Completion — visual logic puzzles across three levels. Veterinary Word Association — find the term that doesn't belong. What Would You Do — everyday decision-making stories. Memory Pair Match — a card matching memory game. Table Pool — an accessible billiards game where you drag to aim and clear the table. And Bowling — drag to aim, pull back to throw, and knock down all ten pins across a full ten-frame game. Take your time, tap any game to begin, and enjoy.`;
 
 function Hub({onSelect}){
   const games=[
@@ -13,6 +14,7 @@ function Hub({onSelect}){
     {id:"stories",  icon:"🌍",title:"What Would You Do?",          desc:"Everyday decision-making scenarios",              color:"#f97316"},
     {id:"memory",   icon:"🃏",title:"Memory Pair Match",           desc:"Flip cards and find the matching pairs",          color:"#fbbf24"},
     {id:"pool",     icon:"🎱",title:"Table Pool",                  desc:"Drag to aim, plan your shot, clear the table",    color:"#f472b6"},
+    {id:"bowling",  icon:"🎳",title:"Bowling",                     desc:"Drag to aim, throw, and knock down all ten pins", color:"#22c55e"},
   ];
   return(<div style={center}><div style={{maxWidth:680,width:"100%",textAlign:"center"}}>
     <div style={{fontSize:72,marginBottom:16}}>🧠</div>
@@ -359,5 +361,6 @@ export default function App(){
   if(view==="stories")  return <StoriesGame    onBack={()=>setView("hub")}/>;
   if(view==="memory")   return <MemoryGame     onBack={()=>setView("hub")}/>;
   if(view==="pool")     return <PoolGame       onBack={()=>setView("hub")}/>;
+  if(view==="bowling")  return <BowlingGame    onBack={()=>setView("hub")}/>;
   return <Hub onSelect={setView}/>;
 }
